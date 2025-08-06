@@ -119,8 +119,18 @@ def scrape_images(board_url: str):
 if __name__ == "__main__":
     ensure_dir()
     
-    # Use default board or ask for input
-    board_url = input(f"Enter Pinterest board URL (press Enter for default: {DEFAULT_BOARD_URL}): ").strip()
+    # Check if running in automated mode (no stdin available)
+    import sys
+    
+    if not sys.stdin.isatty():
+        # Running non-interactively (e.g., from a script or cron)
+        try:
+            board_url = input().strip() if not sys.stdin.closed else ""
+        except (EOFError, OSError):
+            board_url = ""
+    else:
+        # Interactive mode
+        board_url = input(f"Enter Pinterest board URL (press Enter for default: {DEFAULT_BOARD_URL}): ").strip()
     
     if not board_url:
         board_url = DEFAULT_BOARD_URL

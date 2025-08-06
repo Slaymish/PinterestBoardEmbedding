@@ -56,14 +56,18 @@ def run_scraper(board_url=None):
         # Interactive mode
         process = subprocess.run([sys.executable, "pinterest_scraper.py"])
     else:
-        # Use default board
+        # Use default board - send empty line to trigger default
         print(f"Using default board: {DEFAULT_BOARD_URL}")
         process = subprocess.run([sys.executable, "pinterest_scraper.py"], 
-                               input="", text=True, capture_output=True)
+                               input="\n", text=True, capture_output=True)
     
     if process.returncode != 0:
         print(f"❌ Scraper failed: {process.stderr}")
         return False
+    
+    # Show scraper output for feedback
+    if process.stdout:
+        print(process.stdout)
     
     print("✅ Scraping completed")
     return True
