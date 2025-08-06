@@ -5,3 +5,4 @@ pinterest_images/*.gif
 pinterest_images/*.webp
 pinterest_images/*.npy
 weekly_analysis.log
+# CSV configuration files are included in git for easy management

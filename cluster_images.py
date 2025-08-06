@@ -2,6 +2,7 @@
 
 import os
 import json
+import csv
 import torch
 import numpy as np
 from PIL import Image
@@ -19,8 +20,48 @@ from transformers import CLIPProcessor, CLIPModel
 IMG_DIR = Path("pinterest_images")
 METADATA_FILE = IMG_DIR / "metadata.json"
 CLUSTER_FILE = IMG_DIR / "clusters.json"
+CATEGORIES_FILE = Path("cluster_categories.csv")
+REFINEMENTS_FILE = Path("cluster_refinements.csv")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+def load_broad_categories():
+    """Load broad categories from CSV file"""
+    categories = []
+    try:
+        with open(CATEGORIES_FILE, 'r', newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                categories.append(row['category_name'])
+    except FileNotFoundError:
+        print(f"Warning: {CATEGORIES_FILE} not found, using default categories")
+        # Fallback to a basic set if file doesn't exist
+        categories = [
+            "furniture and home decor", "food and cooking", "fashion and style", 
+            "art and creativity", "nature and plants", "architecture and buildings",
+            "technology and gadgets", "aesthetic photography"
+        ]
+    return categories
+
+def load_refinement_mapping():
+    """Load category refinements mapping from CSV file"""
+    refinements = {}
+    try:
+        with open(REFINEMENTS_FILE, 'r', newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                broad_cat = row['broad_category']
+                refined_cat = row['refined_category']
+                
+                if broad_cat not in refinements:
+                    refinements[broad_cat] = []
+                refinements[broad_cat].append(refined_cat)
+    except FileNotFoundError:
+        print(f"Warning: {REFINEMENTS_FILE} not found, using default refinements")
+        # Return empty dict, will fallback to broad category
+        refinements = {}
+    
+    return refinements
 
 def load_metadata():
     with open(METADATA_FILE, "r") as f:
@@ -83,25 +124,100 @@ def cluster_embeddings(embeddings):
     reducer = PCA(n_components=best_components)
     reduced = reducer.fit_transform(embeddings)
 
-    # For small datasets, use very relaxed clustering parameters
-    min_cluster_size = max(2, embeddings.shape[0] // 6)  # More aggressive clustering
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=1,  # Very permissive
-        cluster_selection_epsilon=0.1,  # Allow looser clusters
-        alpha=1.0  # More aggressive cluster formation
-    )
-    labels = clusterer.fit_predict(reduced)
+    # Try HDBSCAN first with optimized parameters
+    labels = try_optimized_hdbscan(reduced)
     
-    # If still no clusters found, try K-means as fallback
-    if len(set(labels)) <= 1 or all(label == -1 for label in labels):
-        print("HDBSCAN found no clusters, trying K-means as fallback...")
+    # If HDBSCAN didn't work well, try optimized K-means
+    if len(set(labels)) <= 1 or all(label == -1 for label in labels) or len(set(labels)) > embeddings.shape[0] // 3:
+        print("HDBSCAN results not optimal, trying K-means with optimization...")
         optimal_k = find_optimal_kmeans_clusters(reduced)
         print(f"Using {optimal_k} clusters for K-means")
         kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
         labels = kmeans.fit_predict(reduced)
     
     return labels, reduced
+
+def try_optimized_hdbscan(data):
+    """Try HDBSCAN with multiple parameter combinations to find best clustering"""
+    n_samples = data.shape[0]
+    
+    # Test different HDBSCAN parameters
+    parameter_combinations = [
+        # (min_cluster_size, min_samples, cluster_selection_epsilon)
+        (max(2, n_samples // 8), 1, 0.1),     # Very permissive
+        (max(3, n_samples // 6), 2, 0.15),    # Moderately permissive  
+        (max(4, n_samples // 5), 3, 0.2),     # More conservative
+        (max(5, n_samples // 4), 2, 0.1),     # Alternative approach
+    ]
+    
+    best_labels = None
+    best_score = -2  # Worse than worst silhouette score
+    best_params = None
+    
+    print("Testing HDBSCAN parameter combinations...")
+    
+    for min_cluster_size, min_samples, epsilon in parameter_combinations:
+        if min_cluster_size >= n_samples // 2:  # Skip if too restrictive
+            continue
+            
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=epsilon,
+            alpha=1.0
+        )
+        
+        labels = clusterer.fit_predict(data)
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        n_noise = list(labels).count(-1)
+        
+        print(f"  min_cluster_size={min_cluster_size}, min_samples={min_samples}, epsilon={epsilon}")
+        print(f"    → {n_clusters} clusters, {n_noise} noise points")
+        
+        # Score this clustering attempt
+        if n_clusters >= 2:  # Need at least 2 clusters to calculate silhouette
+            try:
+                # Filter out noise points for silhouette calculation
+                non_noise_mask = labels != -1
+                if np.sum(non_noise_mask) > 1:  # Need more than 1 non-noise point
+                    filtered_data = data[non_noise_mask]
+                    filtered_labels = labels[non_noise_mask]
+                    
+                    if len(set(filtered_labels)) > 1:  # Multiple clusters
+                        score = silhouette_score(filtered_data, filtered_labels)
+                        
+                        # Penalty for too much noise or too many tiny clusters
+                        noise_penalty = n_noise / n_samples * 0.5
+                        cluster_size_penalty = 0
+                        if n_clusters > n_samples // 4:  # Too many small clusters
+                            cluster_size_penalty = 0.3
+                        
+                        adjusted_score = score - noise_penalty - cluster_size_penalty
+                        
+                        print(f"    → silhouette: {score:.3f}, adjusted: {adjusted_score:.3f}")
+                        
+                        if adjusted_score > best_score:
+                            best_score = adjusted_score
+                            best_labels = labels.copy()
+                            best_params = (min_cluster_size, min_samples, epsilon)
+                    else:
+                        print(f"    → only one cluster after noise removal")
+                else:
+                    print(f"    → too many noise points")
+            except Exception as e:
+                print(f"    → error calculating silhouette: {e}")
+        else:
+            print(f"    → insufficient clusters")
+    
+    if best_labels is not None:
+        n_clusters = len(set(best_labels)) - (1 if -1 in best_labels else 0)
+        n_noise = list(best_labels).count(-1)
+        print(f"Selected HDBSCAN: {n_clusters} clusters, {n_noise} noise (score: {best_score:.3f})")
+        print(f"Parameters: min_cluster_size={best_params[0]}, min_samples={best_params[1]}, epsilon={best_params[2]}")
+        return best_labels
+    else:
+        print("No good HDBSCAN clustering found")
+        return np.array([-1] * len(data))  # All noise
 
 def find_optimal_kmeans_clusters(data):
     """Find optimal number of clusters using elbow method and silhouette score"""
@@ -209,88 +325,8 @@ def generate_dynamic_cluster_labels(images, labels, urls, filenames):
 def discover_cluster_concept(images, processor, model):
     """Dynamically discover what concept best describes a set of images"""
     
-    # Step 1: Try very broad categories first - comprehensive list covering diverse Pinterest content
-    broad_concepts = [
-        # Home & Decor
-        "furniture and home decor", "interior design", "bedroom decor", "living room design", 
-        "kitchen design", "bathroom decor", "outdoor and garden", "lighting and fixtures",
-        "storage and organization", "wall art and decor", "minimalist design", "vintage decor",
-        "modern contemporary design", "rustic farmhouse style", "boho bohemian decor",
-        "scandinavian design", "industrial design", "cozy hygge style", "luxury home decor",
-        
-        # Food & Cooking
-        "food and cooking", "baking and desserts", "healthy recipes", "comfort food",
-        "meal prep", "cocktails and drinks", "food photography", "restaurant dishes",
-        "breakfast ideas", "dinner recipes", "snacks and appetizers", "vegan food",
-        "coffee and tea", "food styling", "kitchen gadgets",
-        
-        # Fashion & Beauty
-        "fashion and style", "women's fashion", "men's fashion", "casual outfits",
-        "formal wear", "shoes and accessories", "jewelry and watches", "bags and purses",
-        "beauty and makeup", "hairstyles", "nail art", "skincare", "street style",
-        "vintage fashion", "sustainable fashion", "plus size fashion", "wedding fashion",
-        
-        # Lifestyle & People
-        "lifestyle photography", "people and portraits", "couples and relationships",
-        "wedding inspiration", "pregnancy and maternity", "children and family",
-        "cute babies", "pets and animals", "friendship goals", "date night ideas",
-        "self care", "mental health", "fitness and wellness", "yoga and meditation",
-        
-        # Creative & Artistic
-        "art and creativity", "paintings and artwork", "crafts and DIY", "handmade items",
-        "creative projects", "artistic photography", "drawing and sketching", "pottery and ceramics",
-        "woodworking", "sewing and embroidery", "paper crafts", "mixed media art",
-        "street art", "digital art", "photography tips",
-        
-        # Specific Aesthetics & Trends
-        "aesthetic photography", "dark academia", "cottagecore", "goblincore", "fairycore",
-        "grunge aesthetic", "soft girl aesthetic", "y2k fashion", "indie aesthetic",
-        "vintage aesthetic", "retro style", "pastel aesthetics", "monochrome style",
-        "neon and bright colors", "earth tones", "neutral colors",
-        
-        # Architecture & Spaces
-        "architecture and buildings", "tiny homes", "cabin retreats", "city apartments",
-        "loft spaces", "greenhouse design", "outdoor living spaces", "pool areas",
-        "treehouse design", "container homes", "architectural details", "room layouts",
-        "space design", "commercial spaces", "retail design",
-        
-        # Nature & Outdoors
-        "nature and plants", "houseplants", "garden design", "flowers and blooms",
-        "landscape photography", "forest and trees", "mountains and hiking",
-        "beach and ocean", "desert landscapes", "seasonal nature", "plant care",
-        "botanical illustration", "succulents and cacti", "herb gardens",
-        
-        # Travel & Places
-        "travel destinations", "vacation spots", "city views", "cultural sites",
-        "road trip inspiration", "camping and outdoors", "hotel design", "restaurant design",
-        "cafe aesthetics", "bookstore design", "museum interiors", "airport design",
-        
-        # Technology & Modern Life
-        "technology and gadgets", "workspace design", "home office", "computer setup",
-        "phone accessories", "smart home", "modern technology", "gaming setup",
-        "productivity tools", "digital nomad", "tech aesthetics",
-        
-        # Textiles & Materials
-        "textiles and fabrics", "fabric patterns", "textile art", "quilting",
-        "knitting and crochet", "weaving", "clothing materials", "home textiles",
-        "tapestries", "rugs and carpets", "curtains and drapes",
-        
-        # Specific Items & Objects
-        "books and reading", "stationery and supplies", "candles and lighting",
-        "mirrors and reflections", "clocks and time", "musical instruments",
-        "sporting goods", "tools and hardware", "collectibles", "vintage items",
-        
-        # Seasonal & Holiday
-        "christmas decorations", "halloween decor", "spring aesthetics", "summer vibes",
-        "autumn colors", "winter cozy", "holiday themes", "party decorations",
-        "birthday celebrations", "seasonal crafts",
-        
-        # Unique & Niche Concepts
-        "hammock indoors", "reading nooks", "cozy corners", "study spaces",
-        "creative workspaces", "meditation spaces", "exercise areas", "hobby rooms",
-        "cute aesthetic", "soft aesthetics", "dark moody", "bright and airy",
-        "maximalist design", "eclectic style", "punk aesthetic", "gothic style"
-    ]
+    # Step 1: Load broad categories from CSV file
+    broad_concepts = load_broad_categories()
     
     best_broad_score = -1
     best_broad_concept = None
@@ -373,82 +409,13 @@ def discover_cluster_concept(images, processor, model):
     return clean_concept_label(final_concept)
 
 def generate_refined_concepts(broad_concept):
-    """Generate more specific concepts based on a broad category"""
-    concept_refinements = {
-        "furniture and home decor": [
-            "chairs and seating", "tables and surfaces", "storage furniture", "decorative objects",
-            "wall art and decor", "shelving and organization", "lighting fixtures", "textiles and cushions",
-            "vintage furniture", "modern furniture", "rustic furniture", "luxury furniture"
-        ],
-        "food and cooking": [
-            "prepared meals", "baking and desserts", "fresh ingredients", "cooking utensils",
-            "kitchen appliances", "food presentation", "beverages and drinks", "healthy food",
-            "comfort food", "gourmet cuisine", "street food", "homemade cooking"
-        ],
-        "fashion and style": [
-            "clothing and outfits", "shoes and accessories", "jewelry and watches", "bags and purses",
-            "beauty and makeup", "hairstyles", "fashion trends", "style inspiration",
-            "casual fashion", "formal wear", "street style", "vintage fashion", "alternative fashion"
-        ],
-        "art and creativity": [
-            "paintings and artwork", "crafts and DIY", "creative projects", "artistic supplies",
-            "handmade items", "creative workspace", "artistic techniques", "mixed media art",
-            "digital art", "street art", "abstract art", "portrait art"
-        ],
-        "nature and plants": [
-            "houseplants and greenery", "flowers and blooms", "garden design", "outdoor plants",
-            "plant care", "botanical photography", "natural textures", "seasonal plants",
-            "succulents", "tropical plants", "herb gardens", "flower arrangements"
-        ],
-        "architecture and buildings": [
-            "interior design", "exterior architecture", "room layouts", "architectural details",
-            "building facades", "construction and renovation", "structural elements", "space design",
-            "tiny homes", "modern architecture", "historic buildings", "commercial spaces"
-        ],
-        "technology and gadgets": [
-            "electronic devices", "computer equipment", "smart home technology", "mobile devices",
-            "audio equipment", "tech accessories", "digital displays", "modern technology",
-            "gaming technology", "workspace tech", "wearable technology"
-        ],
-        "textiles and fabrics": [
-            "fabric patterns", "textile textures", "clothing materials", "home textiles",
-            "embroidery and stitching", "fabric colors", "woven materials", "soft furnishings",
-            "quilting", "knitting", "crochet work", "fabric art"
-        ],
-        "lifestyle photography": [
-            "candid moments", "daily life", "personal style", "lifestyle inspiration",
-            "cozy moments", "aesthetic photography", "mood photography", "storytelling photos"
-        ],
-        "people and portraits": [
-            "portrait photography", "candid people", "group photos", "family portraits",
-            "professional headshots", "artistic portraits", "lifestyle portraits", "cute people"
-        ],
-        "couples and relationships": [
-            "couple goals", "romantic moments", "date ideas", "relationship inspiration",
-            "engagement photos", "cute couples", "love aesthetic", "anniversary ideas"
-        ],
-        "hairstyles": [
-            "short haircuts", "long hairstyles", "curly hair", "straight hair", "braided styles",
-            "hair color ideas", "trendy cuts", "classic styles", "wolf haircuts", "layered cuts",
-            "pixie cuts", "bob haircuts", "hair accessories", "styling techniques"
-        ],
-        "aesthetic photography": [
-            "soft aesthetic", "dark academia", "cottagecore", "grunge aesthetic", "vintage aesthetic",
-            "minimalist aesthetic", "maximalist aesthetic", "indie aesthetic", "y2k aesthetic",
-            "fairycore", "goblincore", "light academia", "dark feminine"
-        ],
-        "cozy hygge style": [
-            "cozy interiors", "hygge lifestyle", "warm lighting", "comfortable spaces",
-            "reading nooks", "cozy corners", "soft textures", "comfort items",
-            "hammock indoors", "cozy bedrooms", "fireplace areas", "warm aesthetics"
-        ],
-        "cute aesthetic": [
-            "kawaii style", "pastel colors", "soft aesthetics", "adorable items",
-            "cute decor", "sweet treats", "plushies", "cute animals", "soft girl aesthetic"
-        ]
-    }
+    """Generate more specific concepts based on a broad category from CSV data"""
+    refinement_mapping = load_refinement_mapping()
     
-    return concept_refinements.get(broad_concept, [broad_concept])
+    # Get refinements from CSV, fallback to the concept itself if not found
+    refined_concepts = refinement_mapping.get(broad_concept, [broad_concept])
+    
+    return refined_concepts
 
 def generate_specific_variations(concept):
     """Generate specific descriptive variations of a concept"""
